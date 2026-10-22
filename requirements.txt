@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pydantic
+bcrypt
+gigachat
+python-dotenv
+joblib
+numpy
+scikit-learn
+pytest
+httpx
