@@ -1,18 +1,34 @@
-from fastapi import FastAPI
 from pydantic import BaseModel
 import sqlite3
 import bcrypt
-from datetime import datetime
-import gigachat
 from gigachat_service import ask_gigachat
-from model_service import predict_scores
+from model_service import predict_scores, predict_decision
 import json
 import re
 import os
+from pathlib import Path
+import jwt
+import secrets
+import hashlib
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from dotenv import load_dotenv
+
+
 app = FastAPI()
 
-DB_PATH = "database/users.db"
+BASE_D = Path(__file__).resolve().parent
+DB_PATH = str(BASE_D / "database" / "users.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+load_dotenv()
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+JWT_ALGORITHM = "HS256"
+
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 30
+
+bearer_scheme = HTTPBearer()
 MIN_WORDS = 50
 MAX_WORDS = 2000
 MAX_REPEAT_PERCENT = 30
@@ -63,20 +79,111 @@ class LoginRequest(BaseModel):
 
 
 class CaseSubmitRequest(BaseModel):
-    user_id: int
     case_id: int
     solution: str
 
 class CaseRatingRequest(BaseModel):
-    user_id: int
     case_id: int
     rating: int
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def hash_refresh_token(token: str):
+    return hashlib.sha256(token.encode()).hexdigest()
+
+def create_access_token(user_id: int):
+    if not JWT_SECRET_KEY:
+        raise RuntimeError("Не задан JWT_SECRET_KEY")
+
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "iat": now,
+        "exp": now + timedelta(
+            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+        )
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM
+    )
+
+def create_refresh_token():
+    return secrets.token_urlsafe(64)
+
+def create_token_pair(user_id: int):
+    access_token = create_access_token(user_id)
+    refresh_token = create_refresh_token()
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    conn = get_connection()
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO RefreshSessions (
+                user_id, token_hash, expires_at, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                hash_refresh_token(refresh_token),
+                expires_at.isoformat(),
+                now.isoformat()
+            )
+        )
+        conn.commit()
+
+    finally:
+        conn.close()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+def get_curr_user(credentials: HTTPAuthorizationCredentials=Depends(bearer_scheme)):
+    token = credentials.credentials
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Недействительный или просроченный токен",
+        headers={"WWW-Authenticate": "Bearer"}
+    )
+    try:
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM]
+        )
+        user_id = int(payload["sub"])
+    except (jwt.InvalidTokenError, ValueError, KeyError, TypeError):
+        raise credentials_exception
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, username, email FROM Users WHERE id = ?",
+        (user_id,)
+    )
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        raise credentials_exception
+    return dict(user)
 
 
 
@@ -95,6 +202,19 @@ def init_database():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS RefreshSessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            revoked_at TEXT,
+            FOREIGN KEY (user_id) REFERENCES Users(id)
+        )
+        """
+    )
 
 
     cursor.execute(
@@ -170,13 +290,131 @@ def init_cases_table():
 
     conn.commit()
     conn.close()
+
+@app.post("/auth/refresh")
+def refresh_tokens(data: RefreshRequest):
+    old_hash = hash_refresh_token(data.refresh_token)
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            """
+            SELECT id, user_id, expires_at
+            FROM RefreshSessions
+            WHERE token_hash = ?
+            AND revoked_at IS NULL
+            """,
+            (old_hash,)
+        )
+        session = cursor.fetchone()
+        if not session:
+            raise HTTPException(
+                status_code=401,
+                detail="Недействительный Refresh Token"
+            )
+        expires_at = datetime.fromisoformat(session["expires_at"])
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=401,
+                detail="Refresh Token истёк"
+            )
+        user_id = session["user_id"]
+        now = datetime.now(timezone.utc)
+        cursor.execute(
+            """
+            UPDATE RefreshSessions
+            SET revoked_at = ?
+            WHERE id = ?
+            """,
+            (now.isoformat(), session["id"])
+        )
+        access_token = create_access_token(user_id)
+        refresh_token = create_refresh_token()
+
+        new_expires_at = now + timedelta(
+            days=REFRESH_TOKEN_EXPIRE_DAYS
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO RefreshSessions (
+                user_id,
+                token_hash,
+                expires_at,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                hash_refresh_token(refresh_token),
+                new_expires_at.isoformat(),
+                now.isoformat()
+            )
+        )
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Не удалось обновить токены"
+        )
+
+    finally:
+        conn.close()
+
+
+@app.post("/logout")
+def logout(
+    data: RefreshRequest,
+    current_user: dict = Depends(get_curr_user)
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        UPDATE RefreshSessions
+        SET revoked_at = ?
+        WHERE token_hash = ?
+        AND user_id = ?
+        AND revoked_at IS NULL
+        """,
+        (
+            datetime.now(timezone.utc).isoformat(),
+            hash_refresh_token(data.refresh_token),
+            current_user["id"]
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Вы вышли из аккаунта"
+    }
+
 def seed_cases():
     cases = [
         {
             "id": 1,
             "title": "ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ МАЛОГО И СРЕДНЕГО БИЗНЕСА",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк запускает программу разработки отраслевых решений для малого и среднего бизнеса (МСБ). Отраслевое решение — это комплексный набор банковских, небанковских и партнёрских сервисов, разработанных специально для клиентов из конкретной отрасли. Цель — максимально эффективно закрыть потребности бизнеса в этой сфере.
 
 Вам, как продуктовой команде банка, поручено выбрать одну отрасль, глубоко её исследовать и предложить комплексное отраслевое решение, которое банк сможет запустить."""
@@ -184,8 +422,7 @@ def seed_cases():
         {
             "id": 2,
             "title": "ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ ОРГАНИЗАЦИЙ КУЛЬТУРНО-ДОСУГОВОГО НАЗНАЧЕНИЯ",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк запускает программу разработки отраслевых решений для организаций, управляющих объектами культурного и досугового назначения (дома культуры, кинотеатры, центры досуга, культурные кластеры, арт-пространства). Отраслевое решение — это комплексный набор банковских, небанковских и партнёрских сервисов, разработанных специально для клиентов из этой сферы. Цель — максимально эффективно закрыть потребности таких организаций и стать для них ключевым финансовым партнёром.
 
 Дополнительный драйвер: в рамках государственной программы Министерства культуры РФ выделяются средства на реконструкцию таких объектов — до 200 тыс. руб. за 1 м² общей площади, но не более 200 млн руб. на один объект. Банк видит возможность стать финансовым партнёром для муниципалитетов и частных инвесторов, участвующих в этой программе.
@@ -195,8 +432,7 @@ def seed_cases():
         {
             "id": 3,
             "title": "ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ РАЗВИТИЯ МАССОВОГО СПОРТА И ФИЗИЧЕСКОЙ КУЛЬТУРЫ",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк рассматривает возможность запуска комплексного отраслевого решения для организаций и муниципалитетов, занимающихся развитием массового спорта и физической культуры. В рамках государственной программы РФ «Развитие физической культуры и спорта» и федерального проекта «Спорт — норма жизни» поставлена цель повысить долю граждан, регулярно занимающихся спортом, до 70% к 2030 году.
 
 Банк видит возможность стать финансовым партнёром для региональных властей, спортивных федераций, фитнес-клубов и частных инвесторов, предложив комплексное решение для достижения целевых показателей. Отраслевое решение — это комплексный набор банковских, небанковских и партнёрских сервисов, разработанных специально для клиентов из конкретной отрасли. Цель — максимально эффективно закрыть потребности всех участников рынка массового спорта.
@@ -206,8 +442,7 @@ def seed_cases():
         {
             "id": 4,
             "title": "КОМПЛЕКСНОЕ ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ СИСТЕМЫ ОБРАЗОВАНИЯ НА БАЗЕ ИСКУССТВЕННОГО ИНТЕЛЛЕКТА",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк рассматривает возможность запуска комплексного отраслевого решения для системы образования на основе искусственного интеллекта. Региональные власти ставят задачу трансформации образования (от раннего детского развития до обучения взрослых) с использованием ИИ для повышения качества и доступности. Банк может стать технологическим и финансовым партнёром, предложив комплексное решение на базе ИИ для одного или нескольких уровней образования.
 
 Отраслевое решение — это комплексный набор банковских, небанковских и партнёрских сервисов, разработанных специально для клиентов из конкретной отрасли. Цель — максимально эффективно закрыть потребности всех участников образовательного процесса в этой сфере.
@@ -217,8 +452,7 @@ def seed_cases():
         {
             "id": 5,
             "title": "ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ НЕФТЕГАЗОВОГО СЕКТОРА",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк запускает программу разработки комплексных отраслевых решений для предприятий топливно-энергетического комплекса (ТЭК). Отраслевое решение — это набор банковских, технологических и партнёрских сервисов, созданных специально для предприятий нефтегазового сектора: нефтегазодобывающих управлений (НГДУ), складов горюче-смазочных материалов (ГСМ), нефтебаз и логистических терминалов. Цель — повысить операционную эффективность, дисциплину исполнения приказов и уровень промышленной безопасности, одновременно став технологическим и финансовым партнёром отрасли.
 
 Проблема, которую нужно решить: в нефтегазовых предприятиях остро стоит проблема неисполнения распоряжений руководства. Приказы издаются многократно, сотрудников лишают премий, но ситуация не меняется. Корневая причина — не «разгильдяйство» персонала, а системные сбои: бюрократические процедуры согласования заявок, перегруженность ремонтных служб, размытая ответственность и отсутствие цифрового учёта. Типичный пример: неработающая вентиляция на складе ГСМ создаёт риски для здоровья сотрудников и пожарной безопасности, но её не могут починить неделями из-за проволочек.
@@ -228,8 +462,7 @@ def seed_cases():
         {
             "id": 6,
             "title": "ФИДЖИТАЛ-ОФИС 2.0 — НОВОЕ ПОКОЛЕНИЕ БАНКОВСКИХ ОТДЕЛЕНИЙ ДЛЯ ГОРОДОВ С НАСЕЛЕНИЕМ ОТ 30 ТЫСЯЧ ЧЕЛОВЕК",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк активно расширяет сеть фиджитал-офисов в городах с населением от 30 тысяч человек. Фиджитал-офис — это инновационный формат отделения, который объединяет:
 
 1. цифровые технологии (биометрическая идентификация, электронная подпись, интеграция с мобильным приложением, видео-консультации, терминалы самообслуживания);
@@ -242,8 +475,7 @@ def seed_cases():
         {
             "id": 7,
             "title": "ЦЕНТР ПОДГОТОВКИ ПРОФЕССИОНАЛОВ БУДУЩЕГО — ОБРАЗОВАТЕЛЬНОЕ УЧРЕЖДЕНИЕ 2050",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк рассматривает возможность стать стратегическим партнёром в создании образовательного учреждения нового поколения. Система образования меняется под влиянием вызовов: персонализация обучения, интеграция ИИ, трансформация рынка труда, появление новых профессий. Учебные заведения будущего должны формировать гибкую образовательную среду, развивать актуальные навыки и эффективно использовать ИИ.
 
 Банк видит возможность предложить комплексное финансовое и технологическое решение для создания Центра подготовки профессионалов будущего — учреждения, которое к 2050 году станет эталоном образования и будет готовить специалистов, востребованных на рынке труда через 10–20 лет.
@@ -253,8 +485,7 @@ def seed_cases():
         {
             "id": 8,
             "title": "ОТРАСЛЕВОЕ РЕШЕНИЕ АЛЬФА-БАНКА ДЛЯ РАЗВИТИЯ ПРОФЕССИОНАЛЬНОГО СПОРТА В РЕГИОНЕ",
-            "description": """Контекст
-
+            "description": """
 Альфа-Банк рассматривает возможность запуска комплексного отраслевого решения для региональных властей, спортивных федераций и школ олимпийского резерва, направленного на развитие профессионального спорта и увеличение числа спортсменов высокого класса.
 
 В рамках государственной программы РФ «Развитие физической культуры и спорта» поставлена задача повышения конкурентоспособности отечественного спорта на международной арене. Банк видит возможность стать финансовым и технологическим партнёром для регионов, предложив комплексное решение по развитию одной спортивной дисциплины: от выявления талантов до подготовки профессиональных спортсменов.
@@ -264,8 +495,7 @@ def seed_cases():
         {
             "id": 9,
             "title": "ЭЛЕКТРОМОБИЛЬНЫЙ КЛАСТЕР ДЛЯ РЕГИОНА",
-            "description": """Контекст
-
+            "description": """
 Мэр крупного региона объявил о запуске долгосрочной программы по улучшению экологической и транспортной ситуации. Ключевая цель — к 2035 году перевести большую часть городского и коммерческого транспорта на электрическую тягу и снизить выбросы CO₂ на 40%.
 
 Для этого регион планирует привлечь крупную промышленную компанию или консорциум инвесторов и организовать на своей территории производство электромобилей и сопутствующей инфраструктуры. Власти готовы предоставить налоговые льготы, земельные участки и административную поддержку, но ждут от инициатора проекта проработанного бизнес-кейса, который будет интересен и инвесторам, и государству.
@@ -275,8 +505,7 @@ def seed_cases():
         {
             "id": 10,
             "title": "АНТИКРИЗИСНАЯ СТРАТЕГИЯ ДЛЯ СЕТИ РЕСТОРАНОВ",
-            "description": """Контекст
-
+            "description": """
 Сеть ресторанов, работающая в сегменте «средний плюс» (средний чек 1500–2500 руб.), оказалась на грани закрытия. В попытке выжить владельцы сконцентрировались на сокращении издержек: перешли на более дешёвых поставщиков, снизили зарплаты персоналу, закрыли учебный центр, сократили маркетинговый бюджет. В результате качество блюд упало, обслуживание ухудшилось, гости ушли, выручка продолжила падать, а убытки выросли.
 
 Акционеры разделились: один настаивает на дальнейшей экономии и «пережидании кризиса», другие готовы рассматривать изменения. Ситуация усугубляется тем, что сеть работает в условиях высокой конкуренции: рядом открываются новые рестораны, растёт популярность доставки и цифровых сервисов, меняются потребительские привычки.
@@ -312,7 +541,7 @@ def seed_cases():
 
 def seed_reference_solutions():
     with open(
-        "reference_solutions.json",
+        BASE_D / "reference_solutions.json",
         "r",
         encoding="utf-8"
     ) as file:
@@ -320,7 +549,6 @@ def seed_reference_solutions():
 
     conn = get_connection()
     cursor = conn.cursor()
-
 
     for case_id, solution in solutions.items():
         cursor.execute(
@@ -334,7 +562,6 @@ def seed_reference_solutions():
         )
 
     conn.commit()
-    print("эталонные решения загружены:", len(solutions))
     conn.close()
 
 
@@ -344,7 +571,7 @@ def migrate_database():
 
     cursor.execute("PRAGMA table_info(CaseResults)")
     columns = [row["name"] for row in cursor.fetchall()]
-
+    nb  = "points" not in columns
 
     if "feedback" not in columns:
         cursor.execute(
@@ -377,38 +604,18 @@ def migrate_database():
 
     conn.commit()
 
-
-    #обновлене старых результатов
-    #они считаются первой попыткой
-    cursor.execute(
-        """
-        SELECT id, score
-        FROM CaseResults
-        WHERE points = 0
-        AND score IS NOT NULL
-        """
-    )
-
-    old_results = cursor.fetchall()
-
-    for result in old_results:
-        score = result["score"]
-
+    if nb:
         cursor.execute(
             """
             UPDATE CaseResults
             SET attempt_number = 1,
                 attempt_coefficient = 1.0,
-                points = ?
-            WHERE id = ?
-            """,
-            (
-                score * 100,
-                result["id"]
-            )
+                points = score * 100
+            WHERE score IS NOT NULL
+            """
         )
+        conn.commit()
 
-    conn.commit()
     conn.close()
 
 init_cases_table()
@@ -429,10 +636,10 @@ def register(user: RegisterRequest):
         (user.email,)
     )
 
-    existing_user = cursor.fetchone()
+    exist_user = cursor.fetchone()
 
 
-    if existing_user:
+    if exist_user:
         conn.close()
         return {
             "success": False,
@@ -466,12 +673,15 @@ def register(user: RegisterRequest):
 
     conn.commit()
     conn.close()
+    tokens = create_token_pair(user_id)
+
     return {
         "success": True,
         "message": "Регистрация успешна",
         "id": user_id,
         "username": user.username,
-        "email": user.email
+        "email": user.email,
+        **tokens
     }
 
 
@@ -486,10 +696,10 @@ def login(user: LoginRequest):
         (user.email,)
     )
 
-    existing_user = cursor.fetchone()
+    exist_user = cursor.fetchone()
     conn.close()
 
-    if not existing_user:
+    if not exist_user:
         return {
             "success": False,
             "message": "Пользователь не найден"
@@ -497,7 +707,7 @@ def login(user: LoginRequest):
 
     if not bcrypt.checkpw(
         user.password.encode(),
-        existing_user["password_hash"].encode()
+        exist_user["password_hash"].encode()
     ):
 
         return {
@@ -505,63 +715,38 @@ def login(user: LoginRequest):
             "message": "Неверный пароль"
         }
 
+    tokens = create_token_pair(exist_user["id"])
+
     return {
         "success": True,
         "message": "Вход выполнен успешно",
-        "id": existing_user["id"],
-        "username": existing_user["username"],
-        "email": existing_user["email"]
+        "id": exist_user["id"],
+        "username": exist_user["username"],
+        "email": exist_user["email"],
+        **tokens
     }
 
 
 @app.get("/profile")
-def get_profile(email: str):
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        """
-        SELECT id, username, email
-        FROM Users
-        WHERE email = ?
-        """,
-        (email,)
-    )
-
-    user = cursor.fetchone()
-    conn.close()
-
-    if not user:
-        return {
-            "success": False,
-            "message": "Пользователь не найден"
-        }
+def get_profile(
+    current_user: dict = Depends(get_curr_user)
+):
     return {
         "success": True,
-        "id": user["id"],
-        "username": user["username"],
-        "email": user["email"]
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "email": current_user["email"]
     }
 
 
-
 @app.get("/profile/stats")
-def get_profile_stats(user_id: int):
+def get_profile_stats(
+    current_user: dict = Depends(get_curr_user)
+):
+    user_id = current_user["id"]
+
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id FROM Users WHERE id = ?",
-        (user_id,)
-    )
-    user = cursor.fetchone()
-
-    if not user:
-        conn.close()
-        return {
-            "success": False,
-            "message": "Пользователь не найден"
-        }
 
     #количество решенных кейсов
     cursor.execute(
@@ -575,7 +760,7 @@ def get_profile_stats(user_id: int):
 
     cases_solved = cursor.fetchone()["cases_solved"]
 
-
+    #средняя оценка пользователя
     cursor.execute(
         """
         SELECT AVG(score) AS average_score
@@ -585,10 +770,14 @@ def get_profile_stats(user_id: int):
         """,
         (user_id,)
     )
+
     average_score = cursor.fetchone()["average_score"]
+
     conn.close()
+
     if average_score is None:
         average_score = 0
+
     return {
         "success": True,
         "cases_solved": cases_solved,
@@ -659,22 +848,14 @@ def get_cases():
 
 
 @app.get("/cases/{case_id}/reference")
-def get_reference_solution(case_id: int, user_id: int):
+def get_reference_solution(
+    case_id: int,
+    current_user: dict = Depends(get_curr_user)
+):
+    user_id = current_user["id"]
+
     conn = get_connection()
     cursor = conn.cursor()
-
-    #проверка пользователя
-    cursor.execute(
-        "SELECT id FROM Users WHERE id = ?",
-        (user_id,)
-    )
-    user = cursor.fetchone()
-    if not user:
-        conn.close()
-        return {
-            "success": False,
-            "message": "Пользователь не найден"
-        }
 
     #проверка кейса
     cursor.execute(
@@ -682,6 +863,7 @@ def get_reference_solution(case_id: int, user_id: int):
         (case_id,)
     )
     case = cursor.fetchone()
+
     if not case:
         conn.close()
         return {
@@ -699,6 +881,7 @@ def get_reference_solution(case_id: int, user_id: int):
         (case_id,)
     )
     reference = cursor.fetchone()
+
     if not reference:
         conn.close()
         return {
@@ -720,8 +903,10 @@ def get_reference_solution(case_id: int, user_id: int):
         """,
         (user_id, case_id)
     )
+
     conn.commit()
     conn.close()
+
     return {
         "success": True,
         "case_id": case_id,
@@ -732,73 +917,87 @@ def get_reference_solution(case_id: int, user_id: int):
 
 
 
+
 @app.post("/cases/submit")
-def submit_case(case: CaseSubmitRequest):
+def submit_case(
+    case: CaseSubmitRequest,
+    current_user: dict = Depends(get_curr_user)
+):
+    user_id = current_user["id"]
+
     conn = get_connection()
     cursor = conn.cursor()
-    #проверка пользователя
-    cursor.execute(
-        "SELECT id FROM Users WHERE id = ?",
-        (case.user_id,)
-    )
-    user = cursor.fetchone()
-    if not user:
-        conn.close()
-        return {
-            "success": False,
-            "message": "Пользователь не найден"
-        }
 
-    #проверка текста решения
-    problem = check_solution(case.solution)
-    if problem:
-        conn.close()
-        return {
-            "success": False,
-            "message": problem
-        }
-
-    #проверка, смотрел ли пользователь эталонное решение
-    cursor.execute(
-        """
-        SELECT reference_viewed
-        FROM UserCases
-        WHERE user_id = ?
-        AND case_id = ?
-        """,
-        (case.user_id, case.case_id)
-    )
-    user_case = cursor.fetchone()
-    if user_case and user_case["reference_viewed"] == 1:
-        conn.close()
-        return {
-            "success": False,
-            "message": "Вы уже посмотрели эталонное решение. Повторное решение кейса недоступно."
-        }
-
-    #определяем номер попытки
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS attempts
-        FROM CaseResults
-        WHERE user_id = ?
-        AND case_id = ?
-        """,
-        (case.user_id, case.case_id)
-    )
-    previous_attempts = cursor.fetchone()["attempts"]
-    attempt_number = previous_attempts + 1
-
-    #коэф попытки, с 4 попытки очки не начисляются
-    if attempt_number == 1:
-        attempt_coefficient = 1.0
-    elif attempt_number == 2:
-        attempt_coefficient = 0.8
-    elif attempt_number == 3:
-        attempt_coefficient = 0.6
-    else:
-        attempt_coefficient = 0.0
     try:
+        #проверка решения млки
+        try:
+            decision = predict_decision(case.solution)
+        except Exception as e:
+            conn.close()
+            return {
+                "success": False,
+                "message": "Не удалось проверить решение. Попробуйте позже."
+            }
+
+        if decision == 0:
+            conn.close()
+            return {
+                "success": False,
+                "message": "Решение не прошло проверку и не может быть отправлено."
+            }
+
+        #проверка текста решения
+        problem = check_solution(case.solution)
+        if problem:
+            conn.close()
+            return {
+                "success": False,
+                "message": problem
+            }
+
+        #проверка смотрел ли пользователь эталонное решение
+        cursor.execute(
+            """
+            SELECT reference_viewed
+            FROM UserCases
+            WHERE user_id = ?
+            AND case_id = ?
+            """,
+            (user_id, case.case_id)
+        )
+        user_case = cursor.fetchone()
+
+        if user_case and user_case["reference_viewed"] == 1:
+            conn.close()
+            return {
+                "success": False,
+                "message": "Вы уже посмотрели эталонное решение. Повторное решение кейса недоступно."
+            }
+
+        #определяем номер попытки
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS attempts
+            FROM CaseResults
+            WHERE user_id = ?
+            AND case_id = ?
+            """,
+            (user_id, case.case_id)
+        )
+
+        previous_attempts = cursor.fetchone()["attempts"]
+        attempt_number = previous_attempts + 1
+
+        #коэф попытки
+        if attempt_number == 1:
+            attempt_coefficient = 1.0
+        elif attempt_number == 2:
+            attempt_coefficient = 0.8
+        elif attempt_number == 3:
+            attempt_coefficient = 0.6
+        else:
+            attempt_coefficient = 0.0
+
         scores = predict_scores(case.solution)
 
         audience = scores["audience"]
@@ -807,7 +1006,7 @@ def submit_case(case: CaseSubmitRequest):
         risks = scores["risks"]
         sol = scores["sol"]
 
-        #оценка от модели от 1 до 5
+        #оценка модели от 1 до 5
         final_score = scores["final_score"]
 
         #итоговая оценка
@@ -881,7 +1080,7 @@ def submit_case(case: CaseSubmitRequest):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                case.user_id,
+                user_id,
                 case.case_id,
                 case.solution,
                 final_score,
@@ -892,6 +1091,7 @@ def submit_case(case: CaseSubmitRequest):
                 datetime.now().isoformat()
             )
         )
+
         result_id = cursor.lastrowid
 
         #записываем состояние пользователя по кейсу
@@ -904,11 +1104,11 @@ def submit_case(case: CaseSubmitRequest):
             )
             VALUES (?, ?, 0)
             """,
-            (case.user_id, case.case_id)
+            (user_id, case.case_id)
         )
+
         conn.commit()
         conn.close()
-
         #ответ андроида
         return {
             "success": True,
@@ -923,12 +1123,11 @@ def submit_case(case: CaseSubmitRequest):
                 "risks": risks,
                 "sol": sol
             },
-            #оценка от модели от 1 до 5
             "score": final_score,
-            #итоговая оценка в рейтинг
             "points": points,
             "feedback": feedback
         }
+
     except Exception as e:
         conn.rollback()
         conn.close()
@@ -936,6 +1135,7 @@ def submit_case(case: CaseSubmitRequest):
             "success": False,
             "message": f"Ошибка обработки решения: {str(e)}"
         }
+
 
 
 @app.post("/ai/test")
@@ -966,7 +1166,11 @@ def test_ai():
 
 
 @app.post("/cases/rate")
-def rate_case(data: CaseRatingRequest):
+def rate_case(
+    data: CaseRatingRequest,
+    current_user: dict = Depends(get_curr_user)
+):
+    user_id = current_user["id"]
     if data.rating < 1 or data.rating > 5:
         return {
             "success": False,
@@ -974,18 +1178,8 @@ def rate_case(data: CaseRatingRequest):
         }
     conn = get_connection()
     cursor = conn.cursor()
-    try:
-        #проверка пользователя
-        cursor.execute(
-            "SELECT id FROM Users WHERE id = ?",
-            (data.user_id,)
-        )
-        if not cursor.fetchone():
-            return {
-                "success": False,
-                "message": "Пользователь не найден"
-            }
 
+    try:
         #проверка кейса
         cursor.execute(
             "SELECT id FROM Cases WHERE id = ?",
@@ -1003,13 +1197,16 @@ def rate_case(data: CaseRatingRequest):
             INSERT INTO CaseRatings (user_id, case_id, rating)
             VALUES (?, ?, ?)
             """,
-            (data.user_id, data.case_id, data.rating)
+            (user_id, data.case_id, data.rating)
         )
+
         conn.commit()
+
         return {
             "success": True,
             "message": "Оценка сохранена"
         }
+
     except sqlite3.IntegrityError:
         conn.rollback()
         return {

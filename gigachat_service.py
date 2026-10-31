@@ -12,7 +12,6 @@ GIGACHAT_BASE_URL = os.getenv(
     "GIGACHAT_BASE_URL",
     "https://api.giga.chat/v1"
 )
-
 GIGACHAT_VERIFY_SSL_CERTS = (
     os.getenv("GIGACHAT_VERIFY_SSL_CERTS", "False").lower() == "true"
 )
