@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_NAMES = ("audience", "finance", "proves", "risks", "sol")
 
 MODELS = {
-    name: joblib.load(BASE_DIR / f"lr_{name}1.joblib")
+    name: joblib.load(BASE_DIR / f"lr_{name} (4).joblib")
     for name in MODEL_NAMES
 }
 

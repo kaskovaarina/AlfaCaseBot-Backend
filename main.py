@@ -6,6 +6,7 @@ import bcrypt
 from gigachat_service import ask_gigachat
 from case_classifier import check_case1
 from model_service import predict_scores, predict_decision
+from reference_checker import check_not_reference
 import json
 import re
 import os
@@ -938,6 +939,15 @@ def submit_case(
 
         case_title = case_data["title"]
         case_description = case_data["description"]
+        reference_check = check_not_reference(
+            case.solution,
+            case_title
+        )
+        if reference_check == 0:
+            return {
+                "success": False,
+                "message": "Ваше решение слишком похоже на эталонное. Пожалуйста, подготовьте собственное решение."
+            }
         problem1 = check_solution(case.solution)
         if problem1:
             return {
