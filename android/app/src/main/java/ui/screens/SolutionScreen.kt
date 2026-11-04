@@ -27,7 +27,7 @@ private val Green = Color(0xFFB9F42B)
 
 private const val MIN_WORDS = 50
 private const val MAX_WORDS = 2000
-private const val MAX_REPEAT_PERCENT = 30
+private const val MAX_REPEAT_PERCENT = 45
 
 private fun getWords(text: String): List<String> {
     return Regex("[A-Za-zА-Яа-яЁё]+")
