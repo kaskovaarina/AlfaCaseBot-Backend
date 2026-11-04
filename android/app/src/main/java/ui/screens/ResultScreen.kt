@@ -291,6 +291,14 @@ fun ResultScreen(
                     color = Background
                 )
             }
+            if (ratingMessage.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = ratingMessage,
+                    color = if (ratingMessage == "Спасибо за оценку!") Green else Red,
+                    fontSize = 14.sp
+                )
+            }
             Spacer(modifier = Modifier.height(20.dp))
         }
     }
@@ -442,18 +450,6 @@ fun ResultScreen(
                     )
                 }
             }
-        )
-    }
-    if (ratingMessage.isNotEmpty()) {
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = ratingMessage,
-            color = if (ratingMessage == "Спасибо за оценку!") {
-                Green
-            } else {
-                Red
-            },
-            fontSize = 14.sp
         )
     }
 }

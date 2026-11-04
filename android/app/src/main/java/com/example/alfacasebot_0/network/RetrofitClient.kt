@@ -11,8 +11,7 @@ import retrofit2.converter.gson.GsonConverterFactory
 import java.util.concurrent.TimeUnit
 
 object RetrofitClient {
-    private const val URL = "http://10.0.2.2:8000/"
-
+    private const val URL = "http://193.108.115.139:8000/"
     @Volatile
     private var apiService: ApiService? = null
 

@@ -24,7 +24,7 @@ private val Green = Color(0xFFB9F42B)
 fun CaseDetailsScreen(
     case: Case,
     onNavigate: (Screen) -> Unit,
-    onStartCase: (Int) -> Unit
+    onStartCase: () -> Unit
 ) {
     Scaffold(
         containerColor = Background,
@@ -90,8 +90,8 @@ fun CaseDetailsScreen(
             Spacer(modifier = Modifier.height(30.dp))
             Button(
                 onClick = {
-                    onStartCase(case.id)
-                },
+                    onStartCase()
+                }   ,
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 54.dp),

@@ -66,7 +66,7 @@ fun RatingScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                text = "Топ 10 пользователей",
+                text = "Топ 5 пользователей",
                 fontSize = 16.sp,
                 color = Text2
             )

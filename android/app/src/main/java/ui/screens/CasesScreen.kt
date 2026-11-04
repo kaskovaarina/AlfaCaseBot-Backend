@@ -187,8 +187,9 @@ fun CaseCard(
         ) {
             Text(
                 text = title,
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
+                fontSize = 21.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 0.3.sp,
                 color = Color.White
             )
             Spacer(modifier = Modifier.height(8.dp))

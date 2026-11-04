@@ -153,7 +153,7 @@ fun HomeScreen(
                     modifier = Modifier.padding(18.dp)
                 ) {
                     Text(
-                        text = "💡 Совет дня",
+                        text = "Совет дня",
                         fontSize = 20.sp,
                         fontWeight = FontWeight.Bold,
                         color = Color.White
