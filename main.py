@@ -34,7 +34,7 @@ REFRESH_TOKEN_EXPIRE_DAYS = 30
 bearer_scheme = HTTPBearer()
 MIN_WORDS = 50
 MAX_WORDS = 2000
-MAX_REPEAT_PERCENT = 30
+MAX_REPEAT_PERCENT = 45
 
 
 def check_solution(text: str):
@@ -975,7 +975,7 @@ def submit_case(
         if decision == 0:
             return {
                 "success": False,
-                "message": "Решение не прошло проверку и не может быть отправлено."
+                "message": "Решение пока невозможно оценить, так как оно не содержит конкретики."
             }
         #проверка смотрел ли пользователь эталонное решение
         cursor.execute(
