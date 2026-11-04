@@ -20,7 +20,7 @@ GIGACHAT_VERIFY_SSL_CERTS = (
 def ask_gigachat(prompt: str) -> str:
     if not GIGACHAT_CREDENTIALS:
         raise RuntimeError(
-            "GIGACHAT_CREDENTIALS не найден. Проверь файл .env"
+            "GIGACHAT_CREDENTIALS не найден."
         )
     with GigaChat(
         credentials=GIGACHAT_CREDENTIALS,

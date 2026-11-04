@@ -45,4 +45,4 @@ def predict_scores(solution: str) -> dict:
 
 def predict_decision(text: str) -> int:
     score = DECISION_MODEL.decision_function([str(text)])[0]
-    return int(score >= -0.1)
+    return int(score >= -0.2)

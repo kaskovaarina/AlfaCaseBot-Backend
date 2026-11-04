@@ -575,7 +575,7 @@ def migrate_database():
 
     cursor.execute("PRAGMA table_info(CaseResults)")
     columns = [row["name"] for row in cursor.fetchall()]
-    nb  = "points" not in columns
+    nb = "points" not in columns
 
     if "feedback" not in columns:
         cursor.execute(
