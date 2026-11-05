@@ -19,6 +19,9 @@ import com.example.alfacasebot_0.model.CaseResult
 import java.util.Locale
 import com.mikepenz.markdown.m3.Markdown
 import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
+import androidx.compose.material3.MaterialTheme
+
 private val Background = Color(0xFF0B0B0C)
 private val Red = Color(0xFFE22B1F)
 private val Gray = Color(0xFF1C1C1E)
@@ -370,6 +373,14 @@ fun ResultScreen(
                         content = referenceSolution,
                         colors = markdownColor(
                             text = Gray2
+                        ),
+                        typography = markdownTypography(
+                            h1 = MaterialTheme.typography.titleLarge,
+                            h2 = MaterialTheme.typography.titleMedium,
+                            h3 = MaterialTheme.typography.titleSmall,
+                            h4 = MaterialTheme.typography.bodyLarge,
+                            h5 = MaterialTheme.typography.bodyMedium,
+                            h6 = MaterialTheme.typography.bodySmall
                         )
                     )
                 }
@@ -386,6 +397,7 @@ fun ResultScreen(
             }
         )
     }
+
     if (showRatingDialog) {
         AlertDialog(
             onDismissRequest = {
@@ -514,7 +526,6 @@ fun getScoreDescription(score: Double): String {
         else -> "Решение требует доработки"
     }
 }
-
 
 fun formatPoints(points: Double): String {
     return if (points % 1.0 == 0.0) {
